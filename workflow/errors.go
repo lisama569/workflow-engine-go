@@ -25,6 +25,16 @@ var (
 	ErrAlreadyTerminal = errors.New("workflow: workflow already in terminal state")
 	// ErrNotSubmitted 工作流尚未提交，无法触发。
 	ErrNotSubmitted = errors.New("workflow: workflow not submitted")
+	// ErrInvalidTimeout 任务超时配置非法（负数）。
+	ErrInvalidTimeout = errors.New("workflow: invalid task timeout")
+	// ErrInvalidBudget 工作流总预算非法（<= 0）。
+	ErrInvalidBudget = errors.New("workflow: invalid workflow budget")
+	// ErrTaskTimeout 单次尝试超出任务声明的最长执行时间。
+	// 出现在 TaskState.LastError 与事件 Detail 中，与普通业务失败可区分。
+	ErrTaskTimeout = errors.New("workflow: task attempt timed out")
+	// ErrBudgetExhausted 工作流总预算耗尽。
+	// 出现在被收口任务的 LastError 与 BUDGET_EXHAUSTED 事件 Detail 中。
+	ErrBudgetExhausted = errors.New("workflow: workflow budget exhausted")
 )
 
 // ValidationError 携带具体任务上下文的校验错误。

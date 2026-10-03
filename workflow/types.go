@@ -16,6 +16,7 @@ const (
 	StatusSucceeded TaskStatus = "SUCCEEDED" // 终态：成功
 	StatusFailed    TaskStatus = "FAILED"    // 终态：重试耗尽
 	StatusSkipped   TaskStatus = "SKIPPED"   // 终态：依赖失败被传播跳过
+	StatusCancelled TaskStatus = "CANCELLED" // 终态：工作流预算耗尽被取消
 )
 
 // WorkflowStatus 工作流聚合状态。
@@ -26,16 +27,17 @@ const (
 	WfRunning   WorkflowStatus = "RUNNING"   // 运行中
 	WfSucceeded WorkflowStatus = "SUCCEEDED" // 终态：全部成功
 	WfFailed    WorkflowStatus = "FAILED"    // 终态：有任务失败/跳过
+	WfCancelled WorkflowStatus = "CANCELLED" // 终态：总预算耗尽被收口
 )
 
 // IsTerminal 判断任务状态是否终态。
 func (s TaskStatus) IsTerminal() bool {
-	return s == StatusSucceeded || s == StatusFailed || s == StatusSkipped
+	return s == StatusSucceeded || s == StatusFailed || s == StatusSkipped || s == StatusCancelled
 }
 
 // IsTerminal 判断工作流状态是否终态。
 func (s WorkflowStatus) IsTerminal() bool {
-	return s == WfSucceeded || s == WfFailed
+	return s == WfSucceeded || s == WfFailed || s == WfCancelled
 }
 
 // TaskFunc 任务执行函数。返回 error 表示本次尝试失败。
@@ -58,7 +60,8 @@ type TaskSpec struct {
 	Deps         []string
 	Fn           TaskFunc
 	Retry        RetryPolicy
-	DepsOptional bool // 预留：非强依赖标记（本版本恒为强依赖）
+	Timeout      time.Duration // 单次尝试的最长执行时间；0 表示不限制
+	DepsOptional bool          // 预留：非强依赖标记（本版本恒为强依赖）
 }
 
 // TaskState 任务的运行时状态。
@@ -77,7 +80,9 @@ type WorkflowState struct {
 	ID          string
 	Status      WorkflowStatus
 	Tasks       map[string]*TaskState
-	Concurrency int // 提交时确定的并发上限，续跑沿用
+	Concurrency int           // 提交时确定的并发上限，续跑沿用
+	Budget      time.Duration // 总执行时间预算；0 表示不限制
+	Deadline    time.Time     // 预算截止时间：首次触发时按 CreatedAt 之后的第一次运行起点设定，续跑沿用
 	CreatedAt   time.Time
 	UpdatedAt   time.Time
 }
@@ -97,6 +102,8 @@ const (
 	ReasonWfDone           EventReason = "WF_DONE"           // 工作流到达终态
 	ReasonResume           EventReason = "RESUME"            // 断点续跑扫描
 	ReasonDeduplicated     EventReason = "DEDUPLICATED"      // 重复触发被幂等忽略
+	ReasonAttemptTimeout   EventReason = "ATTEMPT_TIMEOUT"   // 单次尝试超过任务声明的 Timeout
+	ReasonBudgetExhausted  EventReason = "BUDGET_EXHAUSTED"  // 工作流总预算耗尽
 )
 
 // Event 对外可观测的状态迁移事件。

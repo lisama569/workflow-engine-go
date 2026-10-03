@@ -76,11 +76,20 @@ type SubmitOption func(*submitConfig)
 
 type submitConfig struct {
 	concurrency int
+	budget      time.Duration
 }
 
 // WithConcurrency 设置该工作流的最大并发任务数（默认取引擎默认值）。
 func WithConcurrency(n int) SubmitOption {
 	return func(c *submitConfig) { c.concurrency = n }
+}
+
+// WithBudget 设置工作流总执行时间预算：从首次触发（含续跑的第一次运行）
+// 起算的总时长上限。预算耗尽后不再派发新任务，在途任务被取消，
+// 未完成任务以终态 CANCELLED 收口，工作流落到终态 CANCELLED。
+// 不设置（0）表示不限制。
+func WithBudget(d time.Duration) SubmitOption {
+	return func(c *submitConfig) { c.budget = d }
 }
 
 // Submit 提交工作流。静态校验（重复 ID / 缺失依赖 / 循环依赖 / 非法配置）
@@ -93,6 +102,9 @@ func (e *Engine) Submit(id string, specs []TaskSpec, opts ...SubmitOption) error
 	if cfg.concurrency <= 0 {
 		return &ValidationError{Kind: ErrInvalidConcurrency, Detail: "concurrency must be > 0"}
 	}
+	if cfg.budget < 0 {
+		return &ValidationError{Kind: ErrInvalidBudget, Detail: "budget must be >= 0 (0 = unlimited)"}
+	}
 
 	topo, err := validateAndBuild(specs)
 	if err != nil {
@@ -101,6 +113,9 @@ func (e *Engine) Submit(id string, specs []TaskSpec, opts ...SubmitOption) error
 	for _, sp := range specs {
 		if sp.Retry.MaxRetries < 0 {
 			return &ValidationError{Kind: ErrInvalidRetry, TaskID: sp.ID, Detail: "max retries must be >= 0"}
+		}
+		if sp.Timeout < 0 {
+			return &ValidationError{Kind: ErrInvalidTimeout, TaskID: sp.ID, Detail: "timeout must be >= 0 (0 = unlimited)"}
 		}
 		if sp.Fn == nil {
 			return &ValidationError{Kind: ErrEmptyWorkflow, TaskID: sp.ID, Detail: "task function is nil"}
@@ -113,6 +128,7 @@ func (e *Engine) Submit(id string, specs []TaskSpec, opts ...SubmitOption) error
 		Status:      WfSubmitted,
 		Tasks:       make(map[string]*TaskState, len(specs)),
 		Concurrency: cfg.concurrency,
+		Budget:      cfg.budget,
 		CreatedAt:   now,
 		UpdatedAt:   now,
 	}
@@ -189,6 +205,9 @@ func (e *Engine) startOrJoin(ctx context.Context, id string, resume bool) (*Work
 
 	go func() {
 		final, runErr := e.run(runCtx, id, resume)
+		// 运行结束即取消 runCtx：被超时/预算遗弃的工作协程
+		// （若其函数尚未返回）会观察到 ctx 关闭并退出发送，避免协程滞留。
+		cancel()
 		h.mu.Lock()
 		h.state, h.err = final, runErr
 		h.mu.Unlock()
