@@ -15,6 +15,7 @@ const (
 	StatusRetrying  TaskStatus = "RETRYING"  // 一次尝试失败，退避后重试
 	StatusSucceeded TaskStatus = "SUCCEEDED" // 终态：成功
 	StatusFailed    TaskStatus = "FAILED"    // 终态：重试耗尽
+	StatusCancelled TaskStatus = "CANCELLED" // 终态：工作流预算耗尽被取消
 	StatusSkipped   TaskStatus = "SKIPPED"   // 终态：依赖失败被传播跳过
 )
 
@@ -26,16 +27,19 @@ const (
 	WfRunning   WorkflowStatus = "RUNNING"   // 运行中
 	WfSucceeded WorkflowStatus = "SUCCEEDED" // 终态：全部成功
 	WfFailed    WorkflowStatus = "FAILED"    // 终态：有任务失败/跳过
+	// WfDeadlineExceeded 终态：总预算耗尽。与普通 FAILED 区分，
+	// 表示“到点收场”而非业务失败。
+	WfDeadlineExceeded WorkflowStatus = "DEADLINE_EXCEEDED"
 )
 
 // IsTerminal 判断任务状态是否终态。
 func (s TaskStatus) IsTerminal() bool {
-	return s == StatusSucceeded || s == StatusFailed || s == StatusSkipped
+	return s == StatusSucceeded || s == StatusFailed || s == StatusSkipped || s == StatusCancelled
 }
 
 // IsTerminal 判断工作流状态是否终态。
 func (s WorkflowStatus) IsTerminal() bool {
-	return s == WfSucceeded || s == WfFailed
+	return s == WfSucceeded || s == WfFailed || s == WfDeadlineExceeded
 }
 
 // TaskFunc 任务执行函数。返回 error 表示本次尝试失败。
@@ -59,6 +63,10 @@ type TaskSpec struct {
 	Fn           TaskFunc
 	Retry        RetryPolicy
 	DepsOptional bool // 预留：非强依赖标记（本版本恒为强依赖）
+	// Timeout 单次尝试的最长执行时间；<=0 表示不限时（保持原行为）。
+	// 超时后本次尝试按失败处理（走重试/退避），同时取消传入 Fn 的
+	// ctx，让任务能感知并尽快退出。
+	Timeout time.Duration
 }
 
 // TaskState 任务的运行时状态。
@@ -78,8 +86,14 @@ type WorkflowState struct {
 	Status      WorkflowStatus
 	Tasks       map[string]*TaskState
 	Concurrency int // 提交时确定的并发上限，续跑沿用
-	CreatedAt   time.Time
-	UpdatedAt   time.Time
+	// Budget 提交时声明的总时长预算（<=0 表示无预算）。
+	Budget time.Duration
+	// Deadline 预算对应的绝对截止时间，在第一次触发时按
+	// “首次触发时刻 + Budget” 确定并持久化；续跑沿用同一 Deadline，
+	// 保证预算语义前后一致、可预期。
+	Deadline  time.Time
+	CreatedAt time.Time
+	UpdatedAt time.Time
 }
 
 // EventReason 状态迁移触发依据。
@@ -97,6 +111,12 @@ const (
 	ReasonWfDone           EventReason = "WF_DONE"           // 工作流到达终态
 	ReasonResume           EventReason = "RESUME"            // 断点续跑扫描
 	ReasonDeduplicated     EventReason = "DEDUPLICATED"      // 重复触发被幂等忽略
+	// ReasonAttemptTimeout 单次尝试因超过 TaskSpec.Timeout 被判失败，
+	// 与普通业务失败（ATTEMPT_FAILED）区分。
+	ReasonAttemptTimeout EventReason = "ATTEMPT_TIMEOUT"
+	// ReasonBudgetExhausted 工作流总预算耗尽：不再派发新任务，
+	// 未完成的任务收敛到终态 CANCELLED，工作流落到 DEADLINE_EXCEEDED。
+	ReasonBudgetExhausted EventReason = "BUDGET_EXHAUSTED"
 )
 
 // Event 对外可观测的状态迁移事件。

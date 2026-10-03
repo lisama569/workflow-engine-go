@@ -57,9 +57,11 @@ PENDING ──依赖全部 SUCCEEDED──▶ READY ──获得并发槽──�
                        失败且重试耗尽 ──▶ FAILED
 ```
 
-- `SUCCEEDED / FAILED / SKIPPED` 是**终态**，永不被再次执行或回退。
-- 工作流聚合状态：`SUBMITTED → RUNNING → SUCCEEDED|FAILED`；
-  任一任务 `FAILED/SKIPPED` 则工作流 `FAILED`，否则 `SUCCEEDED`。
+- `SUCCEEDED / FAILED / SKIPPED / CANCELLED` 是**终态**，永不被再次执行或回退
+  （`CANCELLED` 仅由工作流预算耗尽产生，见“工作流总预算语义”）。
+- 工作流聚合状态：`SUBMITTED → RUNNING → SUCCEEDED|FAILED|DEADLINE_EXCEEDED`；
+  任一任务 `FAILED/SKIPPED` 则工作流 `FAILED`，预算耗尽则 `DEADLINE_EXCEEDED`，
+  否则 `SUCCEEDED`。
 
 ## 调度规则
 
@@ -92,6 +94,47 @@ PENDING ──依赖全部 SUCCEEDED──▶ READY ──获得并发槽──�
     最后一次失败信息，下游随后 `SKIPPED`。
 - 退避定时器由协调器管理；`Cancel` 中断时所有定时器被回收，不会在续跑外触发。
 
+## 任务超时语义
+
+- `TaskSpec.Timeout > 0` 声明**单次尝试**的最长执行时间；`<=0`（默认）不限时，行为与之前完全一致。
+- 超时即失败：协调器为每次尝试派生 `context.WithTimeout` 的 ctx 传给任务函数，
+  到期后本次尝试按失败判定，走与业务失败完全相同的重试/退避/耗尽路径；
+  同时 ctx 被取消，任务函数可感知并尽快退出（调度侧不会等它自然返回，
+  其迟到回报会被识别为过期结果丢弃，不会重复计数或迁移状态）。
+- 可区分性：超时失败产生 `ATTEMPT_TIMEOUT` 事件（而非 `ATTEMPT_FAILED`），
+  `LastError` 含哨兵 `ErrTaskTimeout`；重试耗尽时 `RETRIES_EXHAUSTED` 事件详情
+  标注 `timed out`。业务失败（Fn 返回 error）仍走 `ATTEMPT_FAILED`，两者在事件流中明确分开。
+- 超时与重试的边界：超时消耗一次尝试（与业务失败同等计次）；`MaxRetries` 用尽可能
+  进入终态 `FAILED`。超时**不会**让任务被跳过或静默成功。
+
+## 工作流总预算语义
+
+- `WithBudget(d)` 声明整个工作流的总时长预算；`d<=0`（默认）无预算。
+- 预算从**第一次触发**算起：首次触发时把 `Deadline = 首次触发时刻 + Budget`
+  持久化到 `WorkflowState`，续跑、并发触发都沿用同一个 `Deadline`，语义前后一致。
+- 预算到期后：
+  - **不再派发新任务**（循环顶部与派发条件双重判定，定时器到期即唤醒收尾）；
+  - **在跑任务立即取消**而非自然收尾——预算的语义就是到点收场，等待自然收尾
+    可能被卡住的任务无限拖延；在跑任务的 ctx 随协调循环退出被统一取消，可感知退出；
+  - 未完成任务（RUNNING/RETRYING/READY/PENDING）统一收敛到终态 **`CANCELLED`**，
+    已完成任务的 `SUCCEEDED`/`FAILED` 结果原样保留；
+  - 工作流落到终态 **`DEADLINE_EXCEEDED`**，与普通失败 `FAILED` 明确区分，
+    事件原因 `BUDGET_EXHAUSTED`。
+- 与续跑叠加：中断期间预算到期的，`Resume` 不再执行任何任务，直接把未完成
+  任务收敛为 `CANCELLED` 并给出 `DEADLINE_EXCEEDED` 终态结论；该终态同样幂等，
+  重复触发/续跑返回同一快照，状态不回退。
+- 与幂等叠加：并发/重复触发共享同一次执行，预算到期结论唯一，不会因并发多派任务。
+- 资源回收：每次尝试的超时控制复用 `context.WithTimeout`（结果到达或判定后立即
+  cancel），退避定时器在中断/收尾时统一 Stop，预算定时器每次运行只有一个并随
+  运行结束回收——长时间反复运行不会累积定时器或协程
+  （`TestTimeoutResourcesReclaimed` 验证协程数回落到基线）。
+
+## 中断与退避中的尝试计数
+
+- `RUNNING` 被中断：视为同一次尝试的重新执行，续跑沿用原 `Attempt`，不多计。
+- `RETRYING`（退避中）被中断：失败尝试已计数，中断视为退避结束，回收时
+  `Attempt+1`，续跑执行的是下一次尝试，不少计。
+
 ## 断点续跑语义
 
 - `Cancel(id)`（或引擎进程退出）中断执行时：
@@ -120,7 +163,8 @@ PENDING ──依赖全部 SUCCEEDED──▶ READY ──获得并发槽──�
 ## 验证方法
 
 ```bash
-go test -race -v ./...
+go test -race -v ./...        # 逐用例打印名字、覆盖点（COVERAGE）与结果（RESULT）
+go test -race -count=10 ./... # 竞态检测下多轮重复，验证稳定性
 ```
 
 覆盖场景：
@@ -137,6 +181,14 @@ go test -race -v ./...
 | `TestInterruptAndResume` | 执行中 Cancel，已完成任务续跑不重复执行、Attempt 不重复计数 |
 | `TestDuplicateAndConcurrentTriggers` | 5 路并发触发 + 终态后再触发，任务总执行次数唯一 |
 | `TestDeterministicTerminalState` | 同规格 5 次运行终态与 Attempt 完全一致 |
+| `TestTaskTimeout_RetryThenSuccess` | 单任务超时按失败计、任务感知取消、重试后成功，事件与业务失败可区分 |
+| `TestTaskTimeout_RetriesExhausted` | 连续超时耗尽重试后终态 FAILED，LastError 含 ErrTaskTimeout |
+| `TestWorkflowBudgetExhausted` | 总预算到期：不再派发、在跑任务取消、未完成任务 CANCELLED、DEADLINE_EXCEEDED |
+| `TestTimeoutWithInterruptAndResume` | 超时退避期间中断，续跑后尝试计数不重复、终态成功 |
+| `TestBudgetExhaustedBeforeResume` | 中断期间预算到期，续跑直接落 DEADLINE_EXCEEDED，已完成任务不重跑 |
+| `TestConcurrentTriggers_BudgetConclusionUnique` | 预算场景 5 路并发触发结论唯一、不多派任务 |
+| `TestTimeoutAndBudgetValidation` | 负数超时/预算提交期以可区分错误拒绝 |
+| `TestTimeoutResourcesReclaimed` | 20 轮高频超时后协程数回落基线，定时器/协程不累积 |
 
 `-v` 日志中会逐条打印任务状态迁移与触发依据（`[EVENT] REASON ... FROM -> TO`），
 便于人工核对迁移序列自洽性。

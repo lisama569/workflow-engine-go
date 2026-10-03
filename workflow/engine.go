@@ -76,11 +76,19 @@ type SubmitOption func(*submitConfig)
 
 type submitConfig struct {
 	concurrency int
+	budget      time.Duration
 }
 
 // WithConcurrency 设置该工作流的最大并发任务数（默认取引擎默认值）。
 func WithConcurrency(n int) SubmitOption {
 	return func(c *submitConfig) { c.concurrency = n }
+}
+
+// WithBudget 设置工作流总时长预算：从第一次触发算起，到期后不再派发
+// 新任务，未完成任务收敛到终态 CANCELLED，工作流落到 DEADLINE_EXCEEDED。
+// <=0 表示不设预算（保持原行为）。
+func WithBudget(d time.Duration) SubmitOption {
+	return func(c *submitConfig) { c.budget = d }
 }
 
 // Submit 提交工作流。静态校验（重复 ID / 缺失依赖 / 循环依赖 / 非法配置）
@@ -93,6 +101,9 @@ func (e *Engine) Submit(id string, specs []TaskSpec, opts ...SubmitOption) error
 	if cfg.concurrency <= 0 {
 		return &ValidationError{Kind: ErrInvalidConcurrency, Detail: "concurrency must be > 0"}
 	}
+	if cfg.budget < 0 {
+		return &ValidationError{Kind: ErrInvalidBudget, Detail: "budget must be >= 0"}
+	}
 
 	topo, err := validateAndBuild(specs)
 	if err != nil {
@@ -101,6 +112,9 @@ func (e *Engine) Submit(id string, specs []TaskSpec, opts ...SubmitOption) error
 	for _, sp := range specs {
 		if sp.Retry.MaxRetries < 0 {
 			return &ValidationError{Kind: ErrInvalidRetry, TaskID: sp.ID, Detail: "max retries must be >= 0"}
+		}
+		if sp.Timeout < 0 {
+			return &ValidationError{Kind: ErrInvalidTimeout, TaskID: sp.ID, Detail: "timeout must be >= 0"}
 		}
 		if sp.Fn == nil {
 			return &ValidationError{Kind: ErrEmptyWorkflow, TaskID: sp.ID, Detail: "task function is nil"}
@@ -113,6 +127,7 @@ func (e *Engine) Submit(id string, specs []TaskSpec, opts ...SubmitOption) error
 		Status:      WfSubmitted,
 		Tasks:       make(map[string]*TaskState, len(specs)),
 		Concurrency: cfg.concurrency,
+		Budget:      cfg.budget,
 		CreatedAt:   now,
 		UpdatedAt:   now,
 	}
@@ -188,6 +203,9 @@ func (e *Engine) startOrJoin(ctx context.Context, id string, resume bool) (*Work
 	e.runMu.Unlock()
 
 	go func() {
+		// 协调循环退出时释放 runCtx：预算耗尽/中断时未结束的工作协程
+		// 能通过 ctx 感知并退出，不会随运行次数累积泄漏。
+		defer cancel()
 		final, runErr := e.run(runCtx, id, resume)
 		h.mu.Lock()
 		h.state, h.err = final, runErr

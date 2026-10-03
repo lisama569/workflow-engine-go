@@ -19,6 +19,13 @@ var (
 	ErrInvalidConcurrency = errors.New("workflow: invalid concurrency limit")
 	// ErrInvalidRetry 重试配置非法。
 	ErrInvalidRetry = errors.New("workflow: invalid retry config")
+	// ErrInvalidTimeout 任务超时配置非法（负数）。
+	ErrInvalidTimeout = errors.New("workflow: invalid task timeout")
+	// ErrInvalidBudget 工作流总预算非法（负数）。
+	ErrInvalidBudget = errors.New("workflow: invalid workflow budget")
+	// ErrTaskTimeout 单次尝试超时的判定错误，出现在任务 LastError 中，
+	// 可用 errors.Is 区分“超时失败”与“业务失败”。
+	ErrTaskTimeout = errors.New("workflow: task attempt timed out")
 	// ErrWorkflowNotFound 存储中找不到对应工作流。
 	ErrWorkflowNotFound = errors.New("workflow: workflow not found")
 	// ErrAlreadyTerminal 工作流已进入终态，不能再次触发。

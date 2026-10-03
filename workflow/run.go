@@ -2,6 +2,7 @@ package workflow
 
 import (
 	"context"
+	"errors"
 	"reflect"
 	"strconv"
 	"strings"
@@ -31,11 +32,38 @@ func (e *Engine) run(ctx context.Context, id string, resume bool) (final *Workfl
 		return nil, err
 	}
 
+	// 子 ctx：预算耗尽收尾或协调循环退出时统一取消，
+	// 让在跑任务的 Fn 能感知取消、尽快退出。
+	ctx, stopRun := context.WithCancel(ctx)
+	defer stopRun()
+
 	// 本地权威副本（协调器独占），迁移后写穿 Store。
 	tasks := make(map[string]*TaskState, len(wf.Tasks))
 	for k, v := range wf.Tasks {
 		cp := *v
 		tasks[k] = &cp
+	}
+
+	// 总预算：Deadline 在第一次触发时按“首次触发时刻 + Budget”确定并
+	// 持久化；续跑沿用同一 Deadline，保证预算语义前后一致、可预期。
+	if wf.Budget > 0 && wf.Deadline.IsZero() {
+		wf.Deadline = nowHook().Add(wf.Budget)
+		deadline := wf.Deadline
+		_ = e.store.UpdateWorkflow(ctx, id, func(w *WorkflowState) bool {
+			if w.Deadline.IsZero() {
+				w.Deadline = deadline
+			}
+			return true
+		})
+		e.emit(id, "", "", "", ReasonScheduled,
+			"budget "+wf.Budget.String()+" armed; deadline="+wf.Deadline.Format(time.RFC3339Nano))
+	}
+	budgetExpired := func() bool {
+		return !wf.Deadline.IsZero() && !nowHook().Before(wf.Deadline)
+	}
+	// 触发/续跑时预算已耗尽：不派发任何任务，直接收敛到终态。
+	if budgetExpired() {
+		return e.expireBudget(id, wf, tasks, topo)
 	}
 
 	// reclaimAsRetry 标记被中断回收的任务：下一次执行沿用当前尝试计数，
@@ -48,7 +76,9 @@ func (e *Engine) run(ctx context.Context, id string, resume bool) (final *Workfl
 
 	// 回收所有非终态任务：RUNNING/RETRYING 回收到可再次执行的 READY，
 	// READY 保持 READY（中断时已规范化），PENDING 原封不动等待依赖判定。
-	// 终态任务（SUCCEEDED/FAILED/SKIPPED）原样保留，绝不重复执行。
+	// 终态任务（SUCCEEDED/FAILED/SKIPPED/CANCELLED）原样保留，绝不重复执行。
+	// RETRYING 回收时 Attempt+1：失败尝试已计数，中断视为退避结束，
+	// 待发起的重试计为下一次尝试，避免续跑少计一次尝试。
 	for _, tid := range topo {
 		t := tasks[tid]
 		if t.Status.IsTerminal() || t.Status == StatusPending || t.Status == StatusReady {
@@ -58,6 +88,9 @@ func (e *Engine) run(ctx context.Context, id string, resume bool) (final *Workfl
 			continue
 		}
 		from := t.Status
+		if from == StatusRetrying {
+			t.Attempt++
+		}
 		t.Status = StatusReady
 		t.UpdatedAt = nowHook()
 		reclaimAsRetry[tid] = true
@@ -79,7 +112,22 @@ func (e *Engine) run(ctx context.Context, id string, resume bool) (final *Workfl
 	timers := make(map[string]*time.Timer)
 	running := 0
 
-	// stopTimers 在中断时回收所有退避定时器。
+	// 单次尝试超时：不为每次尝试额外建 time.Timer，直接复用
+	// context.WithTimeout 的 Done 通道；结果到达或超时判定后 cancel，
+	// 定时器与协程随本次运行结束（defer stopRun）全部回收。
+	attemptCtxs := make(map[string]context.Context)
+	attemptCancels := make(map[string]context.CancelFunc)
+
+	// 总预算定时器：整个运行只建一个，到期唤醒协调循环做预算收尾。
+	var budgetTimer *time.Timer
+	var budgetCh <-chan time.Time
+	if !wf.Deadline.IsZero() {
+		budgetTimer = time.NewTimer(wf.Deadline.Sub(nowHook()))
+		budgetCh = budgetTimer.C
+		defer budgetTimer.Stop()
+	}
+
+	// stopTimers 在中断/收尾时回收所有退避定时器。
 	stopTimers := func() {
 		for _, tm := range timers {
 			tm.Stop()
@@ -90,6 +138,11 @@ func (e *Engine) run(ctx context.Context, id string, resume bool) (final *Workfl
 	persist := func(t *TaskState) { e.persistTask(ctx, id, t) }
 
 	for {
+		// 0) 预算判定优先于一切调度动作：到期即收尾，不再派发新任务。
+		if budgetExpired() {
+			stopTimers()
+			return e.expireBudget(id, wf, tasks, topo)
+		}
 		// 1) 终态级联与就绪提升：沿拓扑序单遍扫描。
 		//    依赖 FAILED/SKIPPED 的任务标记 SKIPPED；依赖全部 SUCCEEDED
 		//    且仍 PENDING 的任务提升为 READY。已在执行链路上的状态不动。
@@ -120,8 +173,8 @@ func (e *Engine) run(ctx context.Context, id string, resume bool) (final *Workfl
 			}
 		}
 
-		// 2) 派发：有空闲并发槽时，按拓扑序取第一个 READY 任务执行。
-		for running < wf.Concurrency {
+		// 2) 派发：有空闲并发槽且预算未耗尽时，按拓扑序取第一个 READY 任务执行。
+		for running < wf.Concurrency && !budgetExpired() {
 			pick := ""
 			for _, tid := range topo {
 				if tasks[tid].Status == StatusReady {
@@ -156,18 +209,32 @@ func (e *Engine) run(ctx context.Context, id string, resume bool) (final *Workfl
 				persist(t)
 			}
 			running++
-			go func(tid string, fn TaskFunc) {
-				err := fn(ctx)
+			// 单次尝试超时：为本次尝试派生带截止时间的 ctx，
+			// 任务函数能感知取消并尽快退出。
+			taskCtx := ctx
+			if sp.Timeout > 0 {
+				var cancel context.CancelFunc
+				taskCtx, cancel = context.WithTimeout(ctx, sp.Timeout)
+				attemptCtxs[pick] = taskCtx
+				attemptCancels[pick] = cancel
+			}
+			go func(tid string, fn TaskFunc, c context.Context) {
+				err := fn(c)
 				select {
 				case resultCh <- workerResult{taskID: tid, err: err}:
 				case <-ctx.Done():
-					// 协调器已放弃本次执行（中断），结果不再被消费。
+					// 协调器已放弃本次执行（中断/预算收尾），结果不再被消费。
 				}
-			}(pick, sp.Fn)
+			}(pick, sp.Fn, taskCtx)
 		}
 
 		// 3) 完成判定：无运行中任务、无待重试任务、无 READY 任务时结束。
+		//    预算在本轮迭代中途到期的，优先走预算收尾而非正常终态。
 		if running == 0 && len(retryChs) == 0 {
+			if budgetExpired() {
+				stopTimers()
+				return e.expireBudget(id, wf, tasks, topo)
+			}
 			anyReady := false
 			for _, t := range tasks {
 				if t.Status == StatusReady {
@@ -181,44 +248,52 @@ func (e *Engine) run(ctx context.Context, id string, resume bool) (final *Workfl
 			}
 		}
 
-		// 4) 等待事件：工作协程回报、退避到期、外部中断。
-		chs := make([]<-chan time.Time, 0, len(retryChs))
-		taskOfCh := make(map[<-chan time.Time]string, len(retryChs))
+		// 4) 等待事件：工作协程回报、退避到期、尝试超时、预算到期、外部中断。
+		retryList := make([]string, 0, len(retryChs))
+		attemptList := make([]string, 0, len(attemptCtxs))
+		cases := make([]reflect.SelectCase, 0, len(retryChs)+len(attemptCtxs)+3)
+		cases = append(cases, reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(resultCh)})
 		for tid, ch := range retryChs {
-			chs = append(chs, ch)
-			taskOfCh[ch] = tid
+			retryList = append(retryList, tid)
+			cases = append(cases, reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(ch)})
 		}
+		for tid, ac := range attemptCtxs {
+			attemptList = append(attemptList, tid)
+			cases = append(cases, reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(ac.Done())})
+		}
+		budgetIdx := -1
+		if budgetCh != nil {
+			budgetIdx = len(cases)
+			cases = append(cases, reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(budgetCh)})
+		}
+		cases = append(cases, reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(ctx.Done())})
+		abortIdx := len(cases) - 1
 
 		var fired string
+		var timedOut string
 		var res *workerResult
 		var aborted bool
 
-		if len(chs) == 0 {
-			select {
-			case r := <-resultCh:
+		idx, v, ok := reflect.Select(cases)
+		switch {
+		case idx == 0:
+			if ok {
+				r := v.Interface().(workerResult)
 				res = &r
-			case <-ctx.Done():
-				aborted = true
 			}
-		} else {
-			// reflect.Select 动态监听 resultCh + 所有退避通道 + ctx.Done。
-			cases := make([]reflect.SelectCase, 0, len(chs)+2)
-			cases = append(cases, reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(resultCh)})
-			for _, ch := range chs {
-				cases = append(cases, reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(ch)})
-			}
-			cases = append(cases, reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(ctx.Done())})
-			idx, v, ok := reflect.Select(cases)
-			switch {
-			case idx == 0:
-				if ok {
-					r := v.Interface().(workerResult)
-					res = &r
-				}
-			case idx == len(cases)-1:
+		case idx == abortIdx:
+			aborted = true
+		case idx == budgetIdx:
+			// 预算到期：回到循环顶部统一走预算收尾。
+		case idx <= len(retryList):
+			fired = retryList[idx-1]
+		default:
+			tid := attemptList[idx-1-len(retryList)]
+			if errors.Is(attemptCtxs[tid].Err(), context.DeadlineExceeded) {
+				timedOut = tid
+			} else {
+				// 父 ctx 取消（外部中断）联动，按中断处理。
 				aborted = true
-			default:
-				fired = taskOfCh[chs[idx-1]]
 			}
 		}
 
@@ -228,8 +303,18 @@ func (e *Engine) run(ctx context.Context, id string, resume bool) (final *Workfl
 		}
 
 		if res != nil {
-			running--
 			t := tasks[res.taskID]
+			if t.Status != StatusRunning {
+				// 过期回报：该尝试已被超时/预算判定，结果丢弃，
+				// 不再重复计数或迁移状态。
+				continue
+			}
+			running--
+			if cancel, ok := attemptCancels[res.taskID]; ok {
+				cancel() // 释放本次尝试的超时定时器
+				delete(attemptCancels, res.taskID)
+				delete(attemptCtxs, res.taskID)
+			}
 			sp := specs[res.taskID]
 			if res.err == nil {
 				t.LastError = ""
@@ -260,6 +345,39 @@ func (e *Engine) run(ctx context.Context, id string, resume bool) (final *Workfl
 			continue
 		}
 
+		if timedOut != "" {
+			// 单次尝试超时：按失败处理并走原重试/退避；事件与 LastError
+			// 明确标记为超时，与普通业务失败区分。任务函数的 ctx 已被
+			// WithTimeout 取消，可感知退出；其迟到回报会被上方过期防护丢弃。
+			running--
+			if cancel, ok := attemptCancels[timedOut]; ok {
+				cancel()
+				delete(attemptCancels, timedOut)
+				delete(attemptCtxs, timedOut)
+			}
+			t := tasks[timedOut]
+			sp := specs[timedOut]
+			t.LastError = ErrTaskTimeout.Error() + " after " + sp.Timeout.String()
+			if t.Attempt <= sp.Retry.MaxRetries {
+				wait := time.Duration(0)
+				if sp.Retry.Backoff != nil {
+					wait = sp.Retry.Backoff.Next(t.Attempt)
+				}
+				e.transitionTask(ctx, id, t, StatusRetrying, ReasonAttemptTimeout,
+					"attempt "+strconv.Itoa(t.Attempt)+" timed out after "+sp.Timeout.String()+
+						"; retry scheduled in "+wait.String(), persist)
+				tm := time.NewTimer(wait)
+				timers[t.ID] = tm
+				retryChs[t.ID] = tm.C
+			} else {
+				t.EndedAt = nowHook()
+				e.transitionTask(ctx, id, t, StatusFailed, ReasonRetriesExhausted,
+					"attempt "+strconv.Itoa(t.Attempt)+" timed out after "+sp.Timeout.String()+
+						"; no retries left", persist)
+			}
+			continue
+		}
+
 		if fired != "" {
 			delete(retryChs, fired)
 			delete(timers, fired)
@@ -271,12 +389,53 @@ func (e *Engine) run(ctx context.Context, id string, resume bool) (final *Workfl
 	}
 }
 
-// finish 将工作流推进到终态：任一任务 FAILED/SKIPPED 则 FAILED，否则 SUCCEEDED。
+// expireBudget 预算耗尽收尾：不再派发新任务；未完成的任务（含 RUNNING/
+// RETRYING）统一收敛到终态 CANCELLED，已完成任务的终态原样保留；
+// 工作流落到 DEADLINE_EXCEEDED，与普通失败 FAILED 明确区分。
+// 选择“立即取消在跑任务”而非“自然收尾”：预算的语义就是到点收场，
+// 等待自然收尾可能被卡住的任务无限拖延（正是要解决的问题）；
+// 在跑任务的 ctx 随协调循环退出被统一取消，可感知退出，结论可复现。
+func (e *Engine) expireBudget(id string, wf *WorkflowState,
+	tasks map[string]*TaskState, topo []string) (*WorkflowState, error) {
+	ctx := context.Background()
+	for _, tid := range topo {
+		t := tasks[tid]
+		if t.Status.IsTerminal() {
+			continue
+		}
+		from := t.Status
+		t.Status = StatusCancelled
+		t.UpdatedAt = nowHook()
+		if t.EndedAt.IsZero() && (from == StatusRunning || from == StatusRetrying) {
+			t.EndedAt = t.UpdatedAt
+		}
+		e.persistTask(ctx, id, t)
+		e.emit(id, tid, string(from), string(StatusCancelled), ReasonBudgetExhausted,
+			"workflow budget exhausted; task cancelled")
+	}
+	from := wf.Status
+	wf.Status = WfDeadlineExceeded
+	wf.UpdatedAt = nowHook()
+	_ = e.store.UpdateWorkflow(ctx, id, func(w *WorkflowState) bool {
+		w.Status = WfDeadlineExceeded
+		w.UpdatedAt = nowHook()
+		return true
+	})
+	e.emit(id, "", string(from), string(WfDeadlineExceeded), ReasonBudgetExhausted,
+		"workflow budget exhausted; no new tasks dispatched")
+	final, _, _, err := e.store.Load(ctx, id)
+	return final, err
+}
+
+// finish 将工作流推进到终态：任一任务 FAILED/SKIPPED/CANCELLED 则 FAILED，
+// 否则 SUCCEEDED。（CANCELLED 正常只会经 expireBudget 落 DEADLINE_EXCEEDED，
+// 此处防御性兜底。）
 func (e *Engine) finish(ctx context.Context, id string, wf *WorkflowState,
 	tasks map[string]*TaskState, topo []string) (*WorkflowState, error) {
 	target := WfSucceeded
 	for _, tid := range topo {
-		if tasks[tid].Status == StatusFailed || tasks[tid].Status == StatusSkipped {
+		s := tasks[tid].Status
+		if s == StatusFailed || s == StatusSkipped || s == StatusCancelled {
 			target = WfFailed
 			break
 		}
@@ -299,6 +458,11 @@ func (e *Engine) abort(id string, wf *WorkflowState,
 		from := t.Status
 		switch from {
 		case StatusRunning, StatusRetrying:
+			if from == StatusRetrying {
+				// 退避中的任务：失败尝试已计数，中断视为退避结束，
+				// 待发起的重试计为下一次尝试，续跑不会少计。
+				t.Attempt++
+			}
 			t.Status = StatusReady
 		default:
 			t.Status = StatusPending
