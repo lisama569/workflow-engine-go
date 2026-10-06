@@ -10,9 +10,15 @@ import (
 )
 
 // workerResult 工作协程回报。
+// gen 是协调器为每次派发分配的代次号（单调递增），attempt 是派发时的
+// 尝试序号：一次尝试被判超时后，其工作协程可能迟到返回，此时该任务
+// 可能已进入下一次尝试（gen 已推进）或终态；凭 gen 可精确识别这类
+// 迟到回报并丢弃，绝不错记到后续尝试头上。
 type workerResult struct {
-	taskID string
-	err    error
+	taskID  string
+	gen     uint64
+	attempt int
+	err     error
 }
 
 // retryTimer 退避定时器。
@@ -118,6 +124,11 @@ func (e *Engine) run(ctx context.Context, id string, resume bool) (final *Workfl
 	attemptCtxs := make(map[string]context.Context)
 	attemptCancels := make(map[string]context.CancelFunc)
 
+	// 每次派发的代次号：超时判定不会等待工作协程真正退出，其迟到回报
+	// 可能在重试已派发（任务再次 RUNNING）后才到达；仅凭状态无法区分
+	// “本次重试的结果”与“上一次超时尝试的迟到结果”，代次号可以。
+	generations := make(map[string]uint64)
+
 	// 总预算定时器：整个运行只建一个，到期唤醒协调循环做预算收尾。
 	var budgetTimer *time.Timer
 	var budgetCh <-chan time.Time
@@ -218,14 +229,17 @@ func (e *Engine) run(ctx context.Context, id string, resume bool) (final *Workfl
 				attemptCtxs[pick] = taskCtx
 				attemptCancels[pick] = cancel
 			}
-			go func(tid string, fn TaskFunc, c context.Context) {
+			generations[pick]++
+			gen := generations[pick]
+			attempt := t.Attempt
+			go func(tid string, fn TaskFunc, c context.Context, g uint64, att int) {
 				err := fn(c)
 				select {
-				case resultCh <- workerResult{taskID: tid, err: err}:
+				case resultCh <- workerResult{taskID: tid, gen: g, attempt: att, err: err}:
 				case <-ctx.Done():
 					// 协调器已放弃本次执行（中断/预算收尾），结果不再被消费。
 				}
-			}(pick, sp.Fn, taskCtx)
+			}(pick, sp.Fn, taskCtx, gen, attempt)
 		}
 
 		// 3) 完成判定：无运行中任务、无待重试任务、无 READY 任务时结束。
@@ -304,9 +318,18 @@ func (e *Engine) run(ctx context.Context, id string, resume bool) (final *Workfl
 
 		if res != nil {
 			t := tasks[res.taskID]
-			if t.Status != StatusRunning {
-				// 过期回报：该尝试已被超时/预算判定，结果丢弃，
-				// 不再重复计数或迁移状态。
+			if t.Status != StatusRunning || res.gen != generations[res.taskID] {
+				// 迟到回报：该尝试已被超时判定（或运行已中断/收尾），
+				// 其结果到达时本次派发已不再是当前在飞尝试。无论它
+				// 报告成功还是失败都丢弃：不能记到后续重试头上、不能
+				// 推进工作流终态、不能翻回已确定的终态、也不多计
+				// running（超时判定时已结算）。发 STALE_RESULT 事件
+				// 供观测核对，状态本身不变。
+				e.emit(id, res.taskID, string(t.Status), string(t.Status),
+					ReasonStaleResult,
+					"late result from attempt "+strconv.Itoa(res.attempt)+
+						" discarded; attempt already settled (current attempt="+
+						strconv.Itoa(t.Attempt)+")")
 				continue
 			}
 			running--

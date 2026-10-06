@@ -117,6 +117,10 @@ const (
 	// ReasonBudgetExhausted 工作流总预算耗尽：不再派发新任务，
 	// 未完成的任务收敛到终态 CANCELLED，工作流落到 DEADLINE_EXCEEDED。
 	ReasonBudgetExhausted EventReason = "BUDGET_EXHAUSTED"
+	// ReasonStaleResult 一次尝试被判超时（或运行已被中断/收尾）之后，
+	// 该尝试的工作协程才迟到返回：结果被识别并丢弃，不影响后续重试
+	// 的判定，也不改变任何已确定的状态。From/To 为当前状态（不变）。
+	ReasonStaleResult EventReason = "STALE_RESULT"
 )
 
 // Event 对外可观测的状态迁移事件。

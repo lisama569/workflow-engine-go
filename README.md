@@ -16,7 +16,9 @@ workflow/
   engine.go   # 引擎入口：Submit / Trigger / Resume / Cancel / GetState
   run.go      # 单协调器调度循环（状态机唯一写者）
   log.go      # LogEventSink：状态迁移文本日志
-  engine_test.go
+  engine_test.go    # 核心调度/重试/续跑/幂等用例
+  timeout_test.go   # 任务超时与工作流预算用例
+  late_result_test.go # 超时后迟到返回（late result）回归用例
 ```
 
 ## 快速上手
@@ -99,13 +101,40 @@ PENDING ──依赖全部 SUCCEEDED──▶ READY ──获得并发槽──�
 - `TaskSpec.Timeout > 0` 声明**单次尝试**的最长执行时间；`<=0`（默认）不限时，行为与之前完全一致。
 - 超时即失败：协调器为每次尝试派生 `context.WithTimeout` 的 ctx 传给任务函数，
   到期后本次尝试按失败判定，走与业务失败完全相同的重试/退避/耗尽路径；
-  同时 ctx 被取消，任务函数可感知并尽快退出（调度侧不会等它自然返回，
-  其迟到回报会被识别为过期结果丢弃，不会重复计数或迁移状态）。
+  同时 ctx 被取消，任务函数可感知并尽快退出（调度侧不会等它自然返回）。
 - 可区分性：超时失败产生 `ATTEMPT_TIMEOUT` 事件（而非 `ATTEMPT_FAILED`），
   `LastError` 含哨兵 `ErrTaskTimeout`；重试耗尽时 `RETRIES_EXHAUSTED` 事件详情
   标注 `timed out`。业务失败（Fn 返回 error）仍走 `ATTEMPT_FAILED`，两者在事件流中明确分开。
 - 超时与重试的边界：超时消耗一次尝试（与业务失败同等计次）；`MaxRetries` 用尽可能
   进入终态 `FAILED`。超时**不会**让任务被跳过或静默成功。
+
+### 迟到结果（late result）的边界
+
+任务没及时响应取消时，它的返回会**迟到**——到达时本次尝试早已被判定。引擎按
+下面的规则处理，保证结论唯一、可复现：
+
+- **判定以协调器为准，先到先得、判过不翻**：一次尝试一旦被判超时，这次就按
+  超时失败算，照旧走重试与退避；之后该尝试无论返回成功还是失败，都不再改变
+  任何状态。
+- **精确识别，绝不错记**：协调器为每次派发分配单调递增的代次号（generation），
+  工作协程回报时带回。只有“任务处于 `RUNNING` **且**代次号等于当前在飞派发”
+  的回报才被接受。迟到的回报——无论到达时任务在退避中、在下一次重试运行中、
+  还是已进入终态——都被识别为 `STALE_RESULT` 并丢弃：
+  - 不会算到后面那次重试头上（重试成功还是失败只由重试自己的返回决定）；
+  - 不会把工作流提前推进到终态，不会让在跑的重试被跳过或提前记成完成；
+  - 不会翻回已确定的终态（终态不可逆）；
+  - 不会重复扣减并发槽或尝试计数。
+- **可观测**：每次丢弃都发出 `STALE_RESULT` 事件（`From==To`，状态不变），
+  `Detail` 注明迟到结果属于哪次尝试、当前尝试是第几次，事件流与最终状态、
+  尝试次数一一对应。
+- **与退避长短无关**：迟到结果在退避期间到达（按状态丢弃）与在重试运行期间
+  到达（按代次号丢弃）走同一结论；`NoBackoff` 与长退避语义一致，不会出现
+  状态回退。
+- **与续跑叠加**：超时/中断后，卡在原尝试里的协程即使之后返回，其回报也只
+  发往已结束的那次运行（运行 ctx 已取消），不会影响续跑出的新运行；续跑沿用
+  保留的尝试计数，不多计、不少计。
+- **与幂等叠加**：并发/重复触发共享同一次执行，迟到结果不会制造分歧结论，
+  也不会因此多派任务。
 
 ## 工作流总预算语义
 
@@ -157,8 +186,9 @@ PENDING ──依赖全部 SUCCEEDED──▶ READY ──获得并发槽──�
   发出 `DEDUPLICATED` 事件，不执行任何任务。
 - `GetState` 与终态返回值均为 Store 深拷贝，外部持有快照不会污染内部状态。
 - 每个状态迁移都发出 `Event`（`From/To/Reason/Detail`），观测序列即真实执行序列。
-  触发依据包括：`DEPS_MET`、`SCHEDULED`、`ATTEMPT_FAILED`、`RETRY_BACKOFF`、
-  `RETRIES_EXHAUSTED`、`DEP_FAILED`、`WF_DONE`、`RESUME`、`DEDUPLICATED`。
+  触发依据包括：`DEPS_MET`、`SCHEDULED`、`ATTEMPT_FAILED`、`ATTEMPT_TIMEOUT`、
+  `RETRY_BACKOFF`、`RETRIES_EXHAUSTED`、`DEP_FAILED`、`WF_DONE`、`RESUME`、
+  `DEDUPLICATED`、`BUDGET_EXHAUSTED`、`STALE_RESULT`。
 
 ## 验证方法
 
@@ -189,6 +219,12 @@ go test -race -count=10 ./... # 竞态检测下多轮重复，验证稳定性
 | `TestConcurrentTriggers_BudgetConclusionUnique` | 预算场景 5 路并发触发结论唯一、不多派任务 |
 | `TestTimeoutAndBudgetValidation` | 负数超时/预算提交期以可区分错误拒绝 |
 | `TestTimeoutResourcesReclaimed` | 20 轮高频超时后协程数回落基线，定时器/协程不累积 |
+| `TestLateResult_LateSuccessDoesNotHijackRetry` | 超时尝试迟到返回成功（重试在跑、无退避）：被丢弃，不提前终态，重试自身结果定成败 |
+| `TestLateResult_LateFailureDoesNotFailRetry` | 超时尝试迟到返回失败（重试在跑）：被丢弃，重试成功即成功，状态/次数/日志对齐 |
+| `TestLateResult_LateSuccessCannotReverseTerminalFailure` | 重试耗尽落 FAILED 后迟到成功到达：终态不被翻回，重复触发幂等 |
+| `TestLateResult_ArrivesDuringBackoff` | 迟到失败在退避期间到达：与短退避/无退避结论一致，重试成功 |
+| `TestLateResult_TimeoutInterruptResume` | 超时+卡住不响应取消+退避期中断+续跑：迟到返回不影响续跑，尝试计数正确 |
+| `TestLateResult_ConcurrentTriggersConclusionUnique` | 超时+迟到失败场景 5 路并发触发：结论唯一，任务只跑一次 |
 
 `-v` 日志中会逐条打印任务状态迁移与触发依据（`[EVENT] REASON ... FROM -> TO`），
 便于人工核对迁移序列自洽性。
