@@ -9,10 +9,12 @@ import (
 	"time"
 )
 
-// workerResult 工作协程回报。
+// workerResult 工作协程回报。attempt 为派发时的尝试序号：
+// 协调器只接受“当前在跑的这次尝试”的回报，迟到/过期回报一律丢弃。
 type workerResult struct {
-	taskID string
-	err    error
+	taskID  string
+	attempt int
+	err     error
 }
 
 // retryTimer 退避定时器。
@@ -218,14 +220,14 @@ func (e *Engine) run(ctx context.Context, id string, resume bool) (final *Workfl
 				attemptCtxs[pick] = taskCtx
 				attemptCancels[pick] = cancel
 			}
-			go func(tid string, fn TaskFunc, c context.Context) {
+			go func(tid string, fn TaskFunc, c context.Context, attempt int) {
 				err := fn(c)
 				select {
-				case resultCh <- workerResult{taskID: tid, err: err}:
+				case resultCh <- workerResult{taskID: tid, attempt: attempt, err: err}:
 				case <-ctx.Done():
 					// 协调器已放弃本次执行（中断/预算收尾），结果不再被消费。
 				}
-			}(pick, sp.Fn, taskCtx)
+			}(pick, sp.Fn, taskCtx, t.Attempt)
 		}
 
 		// 3) 完成判定：无运行中任务、无待重试任务、无 READY 任务时结束。
@@ -302,13 +304,24 @@ func (e *Engine) run(ctx context.Context, id string, resume bool) (final *Workfl
 			return e.abort(id, wf, tasks, topo)
 		}
 
+		// 迟到回报归一化（在判定成功/失败之前）：
+		// 1) 状态或尝试序号不匹配的回报来自已被判定的旧尝试，直接丢弃，
+		//    绝不允许算到后续重试头上，也不重复扣减在跑计数；
+		// 2) 回报被协调器接收时该尝试已越过超时边界的，按超时处理——
+		//    结论只取决于超时边界，与任务函数退出早晚、select 就绪顺序无关。
 		if res != nil {
 			t := tasks[res.taskID]
-			if t.Status != StatusRunning {
-				// 过期回报：该尝试已被超时/预算判定，结果丢弃，
-				// 不再重复计数或迁移状态。
-				continue
+			if t.Status != StatusRunning || res.attempt != t.Attempt {
+				res = nil
+			} else if ac, ok := attemptCtxs[res.taskID]; ok &&
+				errors.Is(ac.Err(), context.DeadlineExceeded) {
+				timedOut = res.taskID
+				res = nil
 			}
+		}
+
+		if res != nil {
+			t := tasks[res.taskID]
 			running--
 			if cancel, ok := attemptCancels[res.taskID]; ok {
 				cancel() // 释放本次尝试的超时定时器

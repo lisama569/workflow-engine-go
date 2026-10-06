@@ -16,7 +16,9 @@ workflow/
   engine.go   # 引擎入口：Submit / Trigger / Resume / Cancel / GetState
   run.go      # 单协调器调度循环（状态机唯一写者）
   log.go      # LogEventSink：状态迁移文本日志
-  engine_test.go
+  engine_test.go        # 提交校验 / 调度 / 重试 / 依赖 / 中断续跑 / 幂等
+  timeout_test.go       # 任务超时与工作流总预算
+  late_result_test.go   # 超时后迟到返回的隔离语义
 ```
 
 ## 快速上手
@@ -107,6 +109,29 @@ PENDING ──依赖全部 SUCCEEDED──▶ READY ──获得并发槽──�
 - 超时与重试的边界：超时消耗一次尝试（与业务失败同等计次）；`MaxRetries` 用尽可能
   进入终态 `FAILED`。超时**不会**让任务被跳过或静默成功。
 
+### 超时后的迟到回报（late result）
+
+任务没及时响应取消、在超时判定之后才返回时，其回报称为**迟到回报**。边界规则：
+
+- **判定以超时边界为准**：一次尝试被判超时后，该尝试的迟到回报（无论返回成功
+  还是失败）一律丢弃——不算到后续重试头上，不重复扣减在跑计数，不迁移任何状态。
+  本次尝试按超时失败处理，照常走重试/退避；重试那次成功还是失败只由重试自己的
+  回报决定。任务退出得早还是晚，最终状态、尝试次数与事件序列完全一致。
+- **实现机制**：每次派发的回报携带尝试序号，协调器只接受“当前在跑的这次尝试”的
+  回报；序号或状态不匹配的回报直接丢弃。回报被协调器接收时若该尝试已越过超时
+  边界（`ctx` 已 `DeadlineExceeded`），同样按超时处理——结论只取决于超时边界，
+  与 select 就绪顺序无关，同一用例反复跑结论不漂。
+- **不会提前收场、不会翻回终态**：迟到的成功不会把任务/工作流提前推进到终态，
+  也不会把还在跑的重试标记为已完成；已进入终态（含重试耗尽后的 `FAILED`）的
+  任务，迟到回报不能将其翻回。旧运行被中断后，其迟到回报随运行 ctx 取消被丢弃，
+  不会泄漏进续跑。
+- **与幂等叠加**：并发/重复触发仍共享同一次执行，迟到回报不会导致额外派发，
+  结论唯一。
+- **不受影响的场景**：未声明 `Timeout` 的任务没有“迟到”概念，行为完全不变；
+  正常配合取消（ctx 取消后尽快返回）的任务，其返回发生在超时判定之后、
+  状态已离开 `RUNNING`，同样被丢弃，语义与之前一致；退避长短（含无退避）
+  不改变上述结论。
+
 ## 工作流总预算语义
 
 - `WithBudget(d)` 声明整个工作流的总时长预算；`d<=0`（默认）无预算。
@@ -189,6 +214,16 @@ go test -race -count=10 ./... # 竞态检测下多轮重复，验证稳定性
 | `TestConcurrentTriggers_BudgetConclusionUnique` | 预算场景 5 路并发触发结论唯一、不多派任务 |
 | `TestTimeoutAndBudgetValidation` | 负数超时/预算提交期以可区分错误拒绝 |
 | `TestTimeoutResourcesReclaimed` | 20 轮高频超时后协程数回落基线，定时器/协程不累积 |
+| `TestLateFailureAfterTimeout_RetrySuccessDecides` | 超时后迟到返回失败 + 重试自身成功 → SUCCEEDED，迟到失败不算到重试头上 |
+| `TestLateSuccessAfterTimeout_RetryFailureDecides` | 超时后迟到返回成功 + 重试自身失败 → FAILED，迟到成功不翻盘 |
+| `TestLateSuccessAfterTimeout_RetrySucceeds` | 迟到成功 + 重试也成功 → 终态来自重试自己的回报，不提前收场 |
+| `TestLateSuccessAfterTimeout_RetriesExhausted` | 每次尝试都超时且迟到成功 → 额度耗尽 FAILED，终态不被翻回 |
+| `TestLateResultWithInterruptAndResume` | 超时+迟到返回+退避期间中断 → 续跑重试成功，旧回报不泄漏、不多派 |
+| `TestLateResult_ConcurrentTriggersUniqueConclusion` | 超时+迟到返回场景 5 路并发触发，结论唯一、任务只跑一轮 |
+
+迟到回报相关用例的时序用 channel 精确编排（不依赖 sleep 余量）：尝试 1 卡在
+不受取消影响的外部调用里，超时判定后由测试放行其迟到返回，保证迟到回报确定地
+落在“重试仍在执行”的窗口内——这正是原缺陷的触发窗口。
 
 `-v` 日志中会逐条打印任务状态迁移与触发依据（`[EVENT] REASON ... FROM -> TO`），
 便于人工核对迁移序列自洽性。
